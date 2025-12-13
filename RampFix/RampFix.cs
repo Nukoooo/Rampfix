@@ -120,7 +120,7 @@ public class RampFix : IModSharpModule
         {
             _hookManager.PlayerProcessMovePre.RemoveForward(OnPreProcessMovement);
         }
-        catch (Exception e)
+        catch (Exception)
         {
             // ignored
         }
@@ -129,7 +129,7 @@ public class RampFix : IModSharpModule
         {
             _hookManager.PlayerProcessMovePost.RemoveForward(OnPostProcessMovement);
         }
-        catch (Exception e)
+        catch (Exception)
         {
             // ignored
         }
@@ -321,9 +321,9 @@ public class RampFix : IModSharpModule
                                 }
                                 else
                                 {
-                                    offsetDirection = new(offsets[i], offsets[j], offsets[k]);
+                                    offsetDirection = new Vector(offsets[i], offsets[j], offsets[k]).Normalized();
 
-                                    if (LastValidPlaneNormal[slot].Dot(offsetDirection) <= 0.0f)
+                                    if (lastN.Dot(offsetDirection) <= 0.0f)
                                     {
                                         continue;
                                     }
@@ -379,6 +379,11 @@ public class RampFix : IModSharpModule
                                 if (goodTrace || hitNewPlane)
                                 {
                                     TracePlayerBBox(&pierce->EndPosition, &end, bbox, filter, test);
+
+                                    if (!IsValidMovementTrace(test, bbox, filter))
+                                    {
+                                        continue;
+                                    }
 
                                     *pm = *pierce;
 
@@ -630,7 +635,7 @@ public class RampFix : IModSharpModule
             && trace->PlaneNormal.Z > 0.7f
             && lastN.Dot(trace->PlaneNormal.Normalized()) < RAMP_BUG_THRESHOLD)
         {
-            origin += LastValidPlaneNormal[slot] * 0.0625f;
+            origin += lastN * 0.0625f;
             groundOrigin = origin;
             groundOrigin.Z -= 2.0f;
 
