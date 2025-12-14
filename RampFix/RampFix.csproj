@@ -6,7 +6,7 @@
 		<Nullable>enable</Nullable>
 		<AssemblyName>RampFix</AssemblyName>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-		<AssemblyVersion>1.0.2</AssemblyVersion>
+		<AssemblyVersion>1.0.3</AssemblyVersion>
 	</PropertyGroup>
 
 	<ItemGroup>

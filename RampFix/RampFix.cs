@@ -265,9 +265,9 @@ public class RampFix : IModSharpModule
         var numPlanes = 0;
 
         var planes = stackalloc Vector[5];
-        
-        ReadOnlySpan<float> offsets = stackalloc float[3] { 0.0f, -1.0f, 1.0f };
-        var test = stackalloc CGameTrace[1];
+
+        ReadOnlySpan<float> offsets = [0.0f, -1.0f, 1.0f];
+        var                 test    = stackalloc CGameTrace[1];
 
         for (var bumpCount = 0u; bumpCount < 4; bumpCount++)
         {
