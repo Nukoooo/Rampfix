@@ -120,7 +120,7 @@ public class RampFix : IModSharpModule
         {
             _hookManager.PlayerProcessMovePre.RemoveForward(OnPreProcessMovement);
         }
-        catch (Exception e)
+        catch (Exception)
         {
             // ignored
         }
@@ -129,7 +129,7 @@ public class RampFix : IModSharpModule
         {
             _hookManager.PlayerProcessMovePost.RemoveForward(OnPostProcessMovement);
         }
-        catch (Exception e)
+        catch (Exception)
         {
             // ignored
         }
@@ -209,12 +209,22 @@ public class RampFix : IModSharpModule
         return true;
     }
 
-    private static void ClipVelocity(in Vector @in, in Vector normal, out Vector @out)
+    private static void ClipVelocity(in Vector @in, in Vector normal, out Vector @out, float overbounce = 1.0f)
     {
-        var backoff = -((@in.X * normal.X) + ((normal.Z * @in.Z) + (@in.Y * normal.Y))) * 1;
-        backoff = MathF.Max(backoff, 0.0f) + 0.03125f;
-
-        @out = (normal * backoff) + @in;
+        var n = normal.Normalized();
+        if (n.LengthSqr() < 1e-12f)
+        {
+            @out = @in;
+            return;
+        }
+        
+        var backoff = ((@in.X * n.X) + (@in.Y * n.Y) + (@in.Z * n.Z)) * overbounce;
+        
+        @out = @in - (n * backoff);
+        
+        if (MathF.Abs(@out.X) < 1e-6f) @out.X = 0;
+        if (MathF.Abs(@out.Y) < 1e-6f) @out.Y = 0;
+        if (MathF.Abs(@out.Z) < 1e-6f) @out.Z = 0;
     }
 
     private const float FLT_EPSILON = 1.19209e-07f;
@@ -242,7 +252,7 @@ public class RampFix : IModSharpModule
 
         var bbox = stackalloc bbox_t[1];
         bbox->mins = new (-16, -16, 0);
-        bbox->maxs = new (-16, -16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f);
+        bbox->maxs = new (16, 16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f);
 
         var filter    = stackalloc CTraceFilter[1];
 
@@ -255,6 +265,9 @@ public class RampFix : IModSharpModule
         var numPlanes = 0;
 
         var planes = stackalloc Vector[5];
+        
+        ReadOnlySpan<float> offsets = stackalloc float[3] { 0.0f, -1.0f, 1.0f };
+        var test = stackalloc CGameTrace[1];
 
         for (var bumpCount = 0u; bumpCount < 4; bumpCount++)
         {
@@ -279,34 +292,36 @@ public class RampFix : IModSharpModule
                 {
                     break;
                 }
+                
+                var lastN = LastValidPlaneNormal[slot].Normalized();
+                var pmN = pm->PlaneNormal.Normalized();
 
-                if (LastValidPlaneNormal[slot].Length() > FLT_EPSILON
+                if (lastN.Length() > FLT_EPSILON
                     && (!isValidTrace
-                        || pm->PlaneNormal.Dot(LastValidPlaneNormal[slot]) < RAMP_BUG_THRESHOLD
+                        || pmN.Dot(lastN) < RAMP_BUG_THRESHOLD
                         || (potentiallyStuck && pm->Fraction == 0.0f)))
                 {
-                    float[] offsets = [0.0f, -1.0f, 1.0f];
                     var     success = false;
 
-                    var test = stackalloc CGameTrace[1];
+                    test[0] = default;
 
-                    for (var i = 0u; i < 3 && !success; i++)
+                    for (var i = 0; i < 3 && !success; i++)
                     {
-                        for (var j = 0u; j < 3 && !success; j++)
+                        for (var j = 0; j < 3 && !success; j++)
                         {
-                            for (var k = 0u; k < 3 && !success; k++)
+                            for (var k = 0; k < 3 && !success; k++)
                             {
                                 Vector offsetDirection;
 
                                 if (i == 0 && j == 0 && k == 0)
                                 {
-                                    offsetDirection = LastValidPlaneNormal[slot];
+                                    offsetDirection = lastN;
                                 }
                                 else
                                 {
-                                    offsetDirection = new (offsets[i], offsets[j], offsets[k]);
+                                    offsetDirection = new Vector(offsets[i], offsets[j], offsets[k]).Normalized();
 
-                                    if (LastValidPlaneNormal[slot].Dot(offsetDirection) <= 0.0f)
+                                    if (lastN.Dot(offsetDirection) <= 0.0f)
                                     {
                                         continue;
                                     }
@@ -338,17 +353,19 @@ public class RampFix : IModSharpModule
                                     {
                                         continue;
                                     }
+                                    
+                                    var pierceN = pierce->PlaneNormal.Normalized();
+                                    var pmN2 = pm->PlaneNormal.Normalized();
+                                    var lastN2 = LastValidPlaneNormal[slot].Normalized();
 
                                     var validPlane = pierce->Fraction    < 1.0f
                                                      && pierce->Fraction > 0.1f
-                                                     && pierce->PlaneNormal.Dot(LastValidPlaneNormal[slot])
-                                                     >= RAMP_BUG_THRESHOLD;
+                                                     && pierceN.Dot(lastN2) >= RAMP_BUG_THRESHOLD;
 
-                                    hitNewPlane = pm->PlaneNormal.Dot(pierce->PlaneNormal) < NEW_RAMP_THRESHOLD
-                                                  && LastValidPlaneNormal[slot].Dot(pierce->PlaneNormal)
-                                                  > NEW_RAMP_THRESHOLD;
+                                    hitNewPlane = pmN2.Dot(pierceN) < NEW_RAMP_THRESHOLD
+                                                  && lastN2.Dot(pierceN) > NEW_RAMP_THRESHOLD;
 
-                                    goodTrace = MathF.Abs(pierce->Fraction - 1.0f) < float.Epsilon || validPlane;
+                                    goodTrace = MathF.Abs(pierce->Fraction - 1.0f) < (FLT_EPSILON * 4.0f) || validPlane;
 
                                     if (goodTrace)
                                     {
@@ -359,25 +376,38 @@ public class RampFix : IModSharpModule
                                 if (goodTrace || hitNewPlane)
                                 {
                                     TracePlayerBBox(&pierce->EndPosition, &end, bbox, filter, test);
+                                    
+                                    if (!IsValidMovementTrace(test, bbox, filter))
+                                    {
+                                        continue;
+                                    }
 
                                     *pm = *pierce;
-
-                                    pm->Fraction = Math.Clamp((pierce->EndPosition - pierce->StartPosition).Length()
-                                                              / (end               - start).Length(),
-                                                              0.0f,
-                                                              1.0f);
+                                    
+                                    var denom = (end - start).Length();
+                                    if (denom > 1e-6f)
+                                    {
+                                        pm->Fraction = Math.Clamp(
+                                            (pierce->EndPosition - pierce->StartPosition).Length() / denom,
+                                            0.0f,
+                                            1.0f);
+                                    }
+                                    else
+                                    {
+                                        pm->Fraction = 0.0f;
+                                    }
 
                                     pm->EndPosition = test->EndPosition;
 
                                     if (pierce->PlaneNormal.LengthSqr() > 0.0f)
                                     {
                                         pm->PlaneNormal            = pierce->PlaneNormal;
-                                        LastValidPlaneNormal[slot] = pierce->PlaneNormal;
+                                        LastValidPlaneNormal[slot] = pierce->PlaneNormal.Normalized();
                                     }
                                     else
                                     {
                                         pm->PlaneNormal            = test->PlaneNormal;
-                                        LastValidPlaneNormal[slot] = test->PlaneNormal;
+                                        LastValidPlaneNormal[slot] = test->PlaneNormal.Normalized();
                                     }
 
                                     success            = true;
@@ -388,9 +418,10 @@ public class RampFix : IModSharpModule
                     }
                 }
 
-                if (pm->PlaneNormal.Length() > 0.99f)
+                var n = pm->PlaneNormal.Normalized();
+                if (n.Length() > FLT_EPSILON)
                 {
-                    LastValidPlaneNormal[slot] = pm->PlaneNormal;
+                    LastValidPlaneNormal[slot] = n;
                 }
 
                 potentiallyStuck = pm->Fraction == 0.0f;
@@ -417,7 +448,7 @@ public class RampFix : IModSharpModule
                 break;
             }
 
-            planes[numPlanes] = pm->PlaneNormal;
+            planes[numPlanes] = pm->PlaneNormal.Normalized();
             numPlanes++;
 
             if (numPlanes == 1 && pawn.MoveType == MoveType.Walk && !pawn.GroundEntityHandle.IsValid())
@@ -472,7 +503,6 @@ public class RampFix : IModSharpModule
                     var   dir = planes[0].Cross(planes[1]);
                     float d;
                     dir.Normalize();
-                    dir.Normalize();
                     d        = dir.Dot(velocity);
                     velocity = dir * d;
 
@@ -494,10 +524,12 @@ public class RampFix : IModSharpModule
 
     private static unsafe void PostTryPlayerMove(MoveData* mv, PlayerSlot slot)
     {
+        var dot = TpmVelocity[slot].Normalized().Dot(mv->Velocity.Normalized());
+        
         var velocityHeavilyModified =
-            TpmVelocity[slot].Normalized().Dot(mv->Velocity.Normalized()) < RAMP_BUG_THRESHOLD
-            || (TpmVelocity[slot].Length()                            > 50.0f
-                && mv->Velocity.Length() / TpmVelocity[slot].Length() < RAMP_BUG_VELOCITY_THRESHOLD);
+            dot < RAMP_BUG_THRESHOLD 
+            || (TpmVelocity[slot].Length()                        > 50.0f
+            && mv->Velocity.Length() / TpmVelocity[slot].Length() < RAMP_BUG_VELOCITY_THRESHOLD);
 
         if (OverridenTpm[slot]
             && velocityHeavilyModified
@@ -557,8 +589,10 @@ public class RampFix : IModSharpModule
         }
 
         var slot = controller.PlayerSlot;
+        
+        var lastN = LastValidPlaneNormal[slot].Normalized();
 
-        if (stayOnGround || LastValidPlaneNormal[slot].Length() < 0.000001f || LastValidPlaneNormal[slot].Z > 0.7f)
+        if (stayOnGround || lastN.Length() < 0.000001f || lastN.Z > 0.7f)
         {
             goto original;
         }
@@ -570,7 +604,7 @@ public class RampFix : IModSharpModule
 
         var bbox = stackalloc bbox_t[1];
         bbox->mins = new (-16, -16, 0);
-        bbox->maxs = new (-16, -16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f);
+        bbox->maxs = new (16, 16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f);
 
         var filter    = stackalloc CTraceFilter[1];
         var collision = pawn.GetCollisionProperty()!;
@@ -596,9 +630,9 @@ public class RampFix : IModSharpModule
 
         if (trace->Fraction                                       < 0.95f
             && trace->PlaneNormal.Z                               > 0.7f
-            && LastValidPlaneNormal[slot].Dot(trace->PlaneNormal) < RAMP_BUG_THRESHOLD)
+            && lastN.Dot(trace->PlaneNormal.Normalized())         < RAMP_BUG_THRESHOLD)
         {
-            origin         += LastValidPlaneNormal[slot] * 0.0625f;
+            origin         += lastN * 0.0625f;
             groundOrigin   =  origin;
             groundOrigin.Z -= 2.0f;
 
@@ -610,7 +644,7 @@ public class RampFix : IModSharpModule
             }
 
             if (Math.Abs(trace->Fraction - 1.0f)                      < FLT_EPSILON
-                || LastValidPlaneNormal[slot].Dot(trace->PlaneNormal) >= RAMP_BUG_THRESHOLD)
+                || lastN.Dot(trace->PlaneNormal.Normalized())         >= RAMP_BUG_THRESHOLD)
             {
                 mv->AbsOrigin = origin;
             }

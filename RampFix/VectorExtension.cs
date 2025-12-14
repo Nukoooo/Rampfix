@@ -9,12 +9,19 @@ internal static class VectorExtension
         public Vector Normalized()
         {
             var result = vec;
-            var length = MathF.Sqrt((result.X * result.X) + (result.Y * result.Y) + (result.Z * result.Z));
-
-            result.X /= length;
-            result.Y /= length;
-            result.Z /= length;
-
+        
+            var lenSq = (result.X * result.X) + (result.Y * result.Y) + (result.Z * result.Z);
+            if (lenSq < 1e-12f)
+            {
+                return new Vector();
+            }
+        
+            var invLen = 1.0f / MathF.Sqrt(lenSq);
+        
+            result.X *= invLen;
+            result.Y *= invLen;
+            result.Z *= invLen;
+        
             return result;
         }
     }
