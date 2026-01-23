@@ -1,0 +1,64 @@
+name: Build and Package RampFix
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Create output folders
+        run: |
+          mkdir -p sharp/modules/RampFix
+          mkdir -p sharp/gamedata
+
+      - name: Restore dependencies
+        run: dotnet restore RampFix/RampFix.csproj
+
+      - name: Build RampFix.csproj to sharp/modules/RampFix
+        run: dotnet build RampFix/RampFix.csproj -c Release -o sharp/modules/RampFix
+
+      - name: Copy gamedata
+        run: cp gamedata/rampfix.games.jsonc sharp/gamedata/
+
+      - name: Set zip name
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "ZIP_NAME=RampFix-${{ github.event.release.tag_name }}.zip" >> $GITHUB_ENV
+          else
+            echo "ZIP_NAME=RampFix.zip" >> $GITHUB_ENV
+          fi
+
+      - name: Zip sharp folder
+        run: |
+          cd sharp
+          zip -r ../"$ZIP_NAME" .
+
+      - name: Upload zip to release
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ env.ZIP_NAME }}
+          asset_name: ${{ env.ZIP_NAME }}
+          asset_content_type: application/zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RampFix-package
+          path: ${{ env.ZIP_NAME }}
