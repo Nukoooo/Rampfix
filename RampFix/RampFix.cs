@@ -150,7 +150,7 @@ public class RampFix : IModSharpModule
     private const float RAMP_BUG_THRESHOLD = 0.98f;
 
     private const float RAMP_BUG_VELOCITY_THRESHOLD = 0.95f;
-    private const float RAMP_PIERCE_DISTANCE        = 0.0625f;
+    private const float RAMP_PIERCE_DISTANCE        = 0.15f;
     private const float NEW_RAMP_THRESHOLD          = 0.95f;
 
     private static void OnPreProcessMovement(IPlayerProcessMoveForwardParams obj)
