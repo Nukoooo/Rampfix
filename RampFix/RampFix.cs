@@ -260,7 +260,7 @@ public class RampFix : IModSharpModule
         var attribute = RnQueryShapeAttr.PlayerMovement(collision.CollisionAttribute.InteractsWith);
         attribute.SetEntityToIgnore(pawn, 0);
         filter->QueryAttribute = attribute;
-        filter->Vtable         = (CTraceFilterVTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
+        filter->Vtable         = (CTraceFilterVirtualTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
 
         var numPlanes = 0;
 
@@ -612,7 +612,7 @@ public class RampFix : IModSharpModule
         attribute.SetEntityToIgnore(pawn, 0);
 
         filter->QueryAttribute     = attribute;
-        filter->Vtable             = (CTraceFilterVTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
+        filter->Vtable             = (CTraceFilterVirtualTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
         filter->m_bIterateEntities = true;
 
         var origin       = mv->AbsOrigin;
