@@ -46,19 +46,19 @@ public unsafe ref struct CGameTrace
     [FieldOffset(172)]
     public float Fraction;
 
-    [FieldOffset(176)]
+    [FieldOffset(180)]
     public float Triangle;
 
-    [FieldOffset(180)]
+    [FieldOffset(184)]
     public short HitBoxBoneIndex;
 
-    [FieldOffset(182)]
+    [FieldOffset(186)]
     public TraceRayType RayType;
 
-    [FieldOffset(183)]
+    [FieldOffset(187)]
     public bool StartInSolid;
 
-    [FieldOffset(184)]
+    [FieldOffset(188)]
     public bool ExactHitPoint;
 
     public bool DidHit()
