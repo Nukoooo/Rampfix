@@ -530,6 +530,17 @@ public class RampFix : IModSharpModule, IGameListener
                                 continue;
                             }
 
+                            if (MathF.Abs(pierce->Fraction - 1.0f) < FLT_EPSILON * 4.0f)
+                            {
+                                if (VerifyTraceEndNotStuck(pierce, &ray, filter))
+                                {
+                                    goodTrace = true;
+                                    break;
+                                }
+
+                                continue;
+                            }
+
                             var pierceN = pierce->PlaneNormal.Normalized();
 
                             var validPlane = pierce->Fraction      < 1.0f
@@ -539,7 +550,7 @@ public class RampFix : IModSharpModule, IGameListener
                             var wouldHitNewPlane = pmN.Dot(pierceN)      < NEW_RAMP_THRESHOLD
                                                    && lastN.Dot(pierceN) > NEW_RAMP_THRESHOLD;
 
-                            var wouldBeGood = MathF.Abs(pierce->Fraction - 1.0f) < FLT_EPSILON * 4.0f || validPlane;
+                            var wouldBeGood = validPlane;
 
                             // ...then pay for the two verification traces only when this
                             // iteration's outcome can actually change anything. If it can't
