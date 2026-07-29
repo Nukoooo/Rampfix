@@ -274,12 +274,12 @@ public class RampFix : IModSharpModule, IGameListener
     }
 
     private static readonly Vector[] LastValidPlaneNormal = new Vector[PlayerSlot.MaxPlayerCount];
-    private static readonly Vector[] TpmOrigin            = new Vector[PlayerSlot.MaxPlayerCount];
-    private static readonly Vector[] TpmVelocity          = new Vector[PlayerSlot.MaxPlayerCount];
-    private static readonly bool[]   OverridenTpm         = new bool[PlayerSlot.MaxPlayerCount];
     private static readonly bool[]   DidTpm               = new bool[PlayerSlot.MaxPlayerCount];
 
     private const float RAMP_BUG_THRESHOLD = 0.98f;
+
+    private const float GROUND_PLANE_Z = 0.7f;
+    private const float STRAIGHT_WALL_Z = 0.03125f;
 
     private const float RAMP_BUG_VELOCITY_THRESHOLD = 0.95f;
     private const float RAMP_PIERCE_DISTANCE        = 0.15f;
@@ -389,31 +389,24 @@ public class RampFix : IModSharpModule, IGameListener
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ClipVelocity(in Vector @in, in Vector normal, out Vector @out, float overbounce = 1.0f)
+    private static void ClipVelocity(in Vector @in, in Vector normal, out Vector @out)
     {
-        if (normal == default)
-        {
-            @out = @in;
+        var backoff = -((@in.X * normal.X) + ((normal.Z * @in.Z) + (@in.Y * normal.Y)));
 
-            return;
-        }
+        backoff = MathF.Max(backoff, 0.0f) + 0.03125f;
 
-        var backoff = (@in.X * normal.X + @in.Y * normal.Y + @in.Z * normal.Z) * overbounce;
-
-        @out = @in - normal * backoff;
-
-        if (MathF.Abs(@out.X) < 1e-6f) @out.X = 0;
-        if (MathF.Abs(@out.Y) < 1e-6f) @out.Y = 0;
-        if (MathF.Abs(@out.Z) < 1e-6f) @out.Z = 0;
+        @out = normal * backoff + @in;
     }
 
     [SkipLocalsInit]
-    private static unsafe void PreTryPlayerMove(nint        service,
+    private static unsafe bool PreTryPlayerMove(nint        service,
                                                 nint        pawn,
                                                 PlayerSlot  slot,
                                                 MoveData*   mv,
                                                 Vector*     pFirstDest,
-                                                CGameTrace* pFirstTrace)
+                                                CGameTrace* pFirstTrace,
+                                                out Vector  tpmOrigin,
+                                                out Vector  tpmVelocity)
     {
         var frameTime = *(float*) (g_pGlobalVars + CGlobalVars_FrametimeOffset);
         var timeLeft  = frameTime;
@@ -499,14 +492,20 @@ public class RampFix : IModSharpModule, IGameListener
                 var lastN = lastPlane; // already unit-length, no sqrt
                 pmN = pm->PlaneNormal.Normalized();
 
-                // The two verification traces are the expensive half of the old IsValidMovementTrace,
-                // so they go last in the || chain: any cheaper term that short-circuits first (no
-                // previous plane, failed the trace-free validity checks, plane changed too much,
-                // stuck at fraction 0) now skips them entirely. Same accept/reject outcome.
+                var normalChanged = pmN.Dot(lastN) < RAMP_BUG_THRESHOLD;
+                var stuck         = potentiallyStuck && pm->Fraction == 0.0f;
+
+                // A vertical wall is never the ramp we are trying to dodge.
+                var lastValidPlaneWasStraightWall = lastN.Z < STRAIGHT_WALL_Z;
+
+                // (normalChanged && !straightWall) || stuck is the reference trigger; an invalid
+                // trace counts as a candidate too. The verification traces are the expensive half
+                // of IsValidMovementTrace, so they go last in the chain - every cheaper term that
+                // short-circuits first now skips them entirely, with the same accept/reject result.
                 if (lastN != default
-                    && (!basicValid
-                        || pmN.Dot(lastN) < RAMP_BUG_THRESHOLD
-                        || potentiallyStuck && pm->Fraction == 0.0f
+                    && (normalChanged && !lastValidPlaneWasStraightWall
+                        || stuck
+                        || !basicValid
                         || !IsTraceEndVerified(pm, &ray, filter, ref verified)))
                 {
                     var success = false;
@@ -655,7 +654,9 @@ public class RampFix : IModSharpModule, IGameListener
                     }
                 }
 
-                if (pmN != default) // Normalized() returns unit-length or exact zero
+                // Gate on the RAW normal being near unit-length: a shorter one is a deformed plane
+                // we must not start tracking. (Length() > 0.99f, squared to avoid the sqrt.)
+                if (pm->PlaneNormal.LengthSqr() > 0.99f * 0.99f)
                 {
                     lastPlane = pmN;
                 }
@@ -753,23 +754,16 @@ public class RampFix : IModSharpModule, IGameListener
             }
         }
 
-        TpmOrigin[slot]    = pm->EndPosition;
-        TpmVelocity[slot]  = velocity;
-        OverridenTpm[slot] = overrodeTpm;
+        tpmOrigin   = pm->EndPosition;
+        tpmVelocity = velocity;
+
+        return overrodeTpm;
     }
 
     private static readonly Vector EmptyVector = new ();
 
-    private static unsafe void PostTryPlayerMove(MoveData* mv, PlayerSlot slot)
+    private static unsafe void PostTryPlayerMove(MoveData* mv, in Vector tpmOrigin, in Vector tpmVelocity)
     {
-        if (!OverridenTpm[slot])
-        {
-            return;
-        }
-
-        ref var tpmOrigin   = ref TpmOrigin[slot];
-        ref var tpmVelocity = ref TpmVelocity[slot];
-
         if (tpmOrigin == EmptyVector || tpmVelocity == EmptyVector)
         {
             return;
@@ -820,8 +814,7 @@ public class RampFix : IModSharpModule, IGameListener
             return;
         }
 
-        DidTpm[slot]       = true;
-        OverridenTpm[slot] = false;
+        DidTpm[slot] = true;
 
         if (mv->Velocity.LengthSqr() == 0)
         {
@@ -830,9 +823,30 @@ public class RampFix : IModSharpModule, IGameListener
             return;
         }
 
-        PreTryPlayerMove(servicePtr, outer, slot, mv, pFirstDest, pFirstTrace);
+        if (CBaseEntity_IsOnGround(outer))
+        {
+            LastValidPlaneNormal[slot] = default;
+
+            CCSPlayer_MovementService_TryPlayerMoveOriginal(servicePtr, mv, pFirstDest, pFirstTrace, pIsSurfing);
+
+            return;
+        }
+
+        var overrode = PreTryPlayerMove(servicePtr,
+                                        outer,
+                                        slot,
+                                        mv,
+                                        pFirstDest,
+                                        pFirstTrace,
+                                        out var tpmOrigin,
+                                        out var tpmVelocity);
+
         CCSPlayer_MovementService_TryPlayerMoveOriginal(servicePtr, mv, pFirstDest, pFirstTrace, pIsSurfing);
-        PostTryPlayerMove(mv, slot);
+
+        if (overrode)
+        {
+            PostTryPlayerMove(mv, tpmOrigin, tpmVelocity);
+        }
     }
 
     [UnmanagedCallersOnly]
@@ -864,7 +878,7 @@ public class RampFix : IModSharpModule, IGameListener
 
         var lastN = LastValidPlaneNormal[slot]; // invariant: unit-length or zero
 
-        if (lastN == default || lastN.Z > 0.7f)
+        if (lastN == default || lastN.Z > GROUND_PLANE_Z)
         {
             goto original;
         }
@@ -901,7 +915,7 @@ public class RampFix : IModSharpModule, IGameListener
         }
 
         if (trace->Fraction                               < 0.95f
-            && trace->PlaneNormal.Z                       > 0.7f
+            && trace->PlaneNormal.Z                       > GROUND_PLANE_Z
             && lastN.Dot(trace->PlaneNormal.Normalized()) < RAMP_BUG_THRESHOLD)
         {
             origin         += lastN * 0.0625f;
