@@ -16,15 +16,6 @@ using Sharp.Shared.Units;
 
 namespace RampFix;
 
-[StructLayout(LayoutKind.Explicit, Pack = 4)]
-internal struct bbox_t
-{
-    [FieldOffset(0)]
-    public Vector mins;
-    [FieldOffset(12)]
-    public Vector maxs;
-}
-
 public class RampFix : IModSharpModule, IGameListener
 {
     string IModSharpModule.DisplayName   => "RampFix";
@@ -38,16 +29,15 @@ public class RampFix : IModSharpModule, IGameListener
         CCSPlayer_MovementService_TryPlayerMoveOriginal;
     private static unsafe delegate* unmanaged<nint, MoveData*, bool, void> CCSPlayer_MovementService_CategorizePositionOrigin;
 
-    private static unsafe delegate* unmanaged<IntPtr, TraceShapeRay*, Vector*, Vector*, CTraceFilter*, CGameTrace*, bool>
-        TraceShape;
+    private static unsafe delegate* unmanaged[SuppressGCTransition]<IntPtr, TraceShapeRay*, Vector*, Vector*,
+        CTraceFilter*, CGameTrace*, bool> TraceShape;
 
     private static nint g_pPhysicsQuery = 0;
 
     private readonly IGameData    _gameData;
     private readonly IHookManager _hookManager;
 
-    private static IModSharp   _modSharp;
-    private static IGlobalVars _globalVars => _modSharp.GetGlobals();
+    private static IModSharp _modSharp;
 
     private static nint CTraceFilterPlayerMovementCS_vtable;
 
@@ -192,7 +182,8 @@ public class RampFix : IModSharpModule, IGameListener
             return false;
         }
 
-        TraceShape = (delegate* unmanaged<IntPtr, TraceShapeRay*, Vector*, Vector*, CTraceFilter*, CGameTrace*, bool>) address;
+        TraceShape = (delegate* unmanaged[SuppressGCTransition]<IntPtr, TraceShapeRay*, Vector*, Vector*, CTraceFilter*,
+            CGameTrace*, bool>) address;
 
         if (!_modSharp.GetGameData().GetAddress("g_pPhysicsQuery", out address))
         {
@@ -381,6 +372,23 @@ public class RampFix : IModSharpModule, IGameListener
     private static unsafe bool IsValidMovementTrace(CGameTrace* trace, TraceShapeRay* ray, CTraceFilter* filter)
         => IsTraceBasicallyValid(trace) && VerifyTraceEndNotStuck(trace, ray, filter);
 
+    // -1 = not traced yet, 0 = stuck, 1 = clear.
+    // Lets the caller put the two traces last in a || chain without ever paying for them twice.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe bool IsTraceEndVerified(CGameTrace*   trace,
+                                                  TraceShapeRay* ray,
+                                                  CTraceFilter*  filter,
+                                                  ref int        cached)
+    {
+        if (cached < 0)
+        {
+            cached = VerifyTraceEndNotStuck(trace, ray, filter) ? 1 : 0;
+        }
+
+        return cached != 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ClipVelocity(in Vector @in, in Vector normal, out Vector @out, float overbounce = 1.0f)
     {
         if (normal == default)
@@ -447,13 +455,21 @@ public class RampFix : IModSharpModule, IGameListener
 
         ref var lastPlane = ref LastValidPlaneNormal[slot]; // single bounds check for the whole method
 
+        // Neither can change while we simulate - we never re-enter engine movement code here.
+        var isWalkingInAir = CBaseEntity_GetMovetype(pawn) == MoveType.Walk && !CBaseEntity_IsOnGround(pawn);
+
+        var overrodeTpm = false;
+
         for (var bumpCount = 0u; bumpCount < 4; bumpCount++)
         {
             end = start + (velocity * timeLeft);
 
+            Vector pmN; // pm->PlaneNormal, unit-length or exactly zero
+
             if (pFirstDest != null && *pFirstDest == end)
             {
                 *pm = *pFirstTrace;
+                pmN = pm->PlaneNormal.Normalized();
             }
             else
             {
@@ -461,23 +477,37 @@ public class RampFix : IModSharpModule, IGameListener
 
                 if (start == end)
                 {
-                    continue;
-                }
-
-                var isValidTrace = IsValidMovementTrace(pm, &ray, filter);
-
-                if (isValidTrace && MathF.Abs(pm->Fraction - 1.0f) < FLT_EPSILON)
-                {
+                    // Nothing left to sweep. start/velocity/timeLeft can no longer change, so every
+                    // remaining bump would re-run this exact degenerate trace and land on the same
+                    // pm - break out instead of burning three more traces on it.
                     break;
                 }
 
-                var lastN = lastPlane; // already unit-length, no sqrt
-                var pmN   = pm->PlaneNormal.Normalized();
+                var basicValid = IsTraceBasicallyValid(pm);
+                var verified   = -1;
 
+                if (basicValid && MathF.Abs(pm->Fraction - 1.0f) < FLT_EPSILON)
+                {
+                    verified = VerifyTraceEndNotStuck(pm, &ray, filter) ? 1 : 0;
+
+                    if (verified == 1)
+                    {
+                        break;
+                    }
+                }
+
+                var lastN = lastPlane; // already unit-length, no sqrt
+                pmN = pm->PlaneNormal.Normalized();
+
+                // The two verification traces are the expensive half of the old IsValidMovementTrace,
+                // so they go last in the || chain: any cheaper term that short-circuits first (no
+                // previous plane, failed the trace-free validity checks, plane changed too much,
+                // stuck at fraction 0) now skips them entirely. Same accept/reject outcome.
                 if (lastN != default
-                    && (!isValidTrace
+                    && (!basicValid
                         || pmN.Dot(lastN) < RAMP_BUG_THRESHOLD
-                        || potentiallyStuck && pm->Fraction == 0.0f))
+                        || potentiallyStuck && pm->Fraction == 0.0f
+                        || !IsTraceEndVerified(pm, &ray, filter, ref verified)))
                 {
                     var success = false;
 
@@ -616,17 +646,18 @@ public class RampFix : IModSharpModule, IGameListener
                                 lastPlane       = test->PlaneNormal.Normalized();
                             }
 
-                            success            = true;
-                            OverridenTpm[slot] = true;
+                            success     = true;
+                            overrodeTpm = true;
+
+                            // *pm's normal was just replaced; lastPlane already holds its unit form.
+                            pmN = lastPlane;
                         }
                     }
                 }
 
-                var n = pm->PlaneNormal.Normalized();
-
-                if (n != default) // Normalized() returns unit-length or exact zero
+                if (pmN != default) // Normalized() returns unit-length or exact zero
                 {
-                    lastPlane = n;
+                    lastPlane = pmN;
                 }
 
                 potentiallyStuck = pm->Fraction == 0.0f;
@@ -656,10 +687,10 @@ public class RampFix : IModSharpModule, IGameListener
                 break;
             }
 
-            planes[numPlanes] = pm->PlaneNormal.Normalized();
+            planes[numPlanes] = pmN;
             numPlanes++;
 
-            if (numPlanes == 1 && CBaseEntity_GetMovetype(pawn) == MoveType.Walk && !CBaseEntity_IsOnGround(pawn))
+            if (numPlanes == 1 && isWalkingInAir)
             {
                 ClipVelocity(velocity, planes[0], out velocity);
             }
@@ -722,8 +753,9 @@ public class RampFix : IModSharpModule, IGameListener
             }
         }
 
-        TpmOrigin[slot]   = pm->EndPosition;
-        TpmVelocity[slot] = velocity;
+        TpmOrigin[slot]    = pm->EndPosition;
+        TpmVelocity[slot]  = velocity;
+        OverridenTpm[slot] = overrodeTpm;
     }
 
     private static readonly Vector EmptyVector = new ();
