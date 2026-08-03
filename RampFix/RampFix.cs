@@ -8,7 +8,6 @@ using Sharp.Shared.HookParams;
 using Sharp.Shared.Hooks;
 using Sharp.Shared.Listeners;
 using Sharp.Shared.Managers;
-using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using Sharp.Shared.Units;
 
@@ -762,7 +761,7 @@ public class RampFix : IModSharpModule, IGameListener
 
     private static readonly Vector EmptyVector = new ();
 
-    private static unsafe void PostTryPlayerMove(MoveData* mv, in Vector tpmOrigin, in Vector tpmVelocity)
+    private static unsafe void PostTryPlayerMove(MoveData* mv, ref Vector tpmOrigin, ref Vector tpmVelocity)
     {
         if (tpmOrigin == EmptyVector || tpmVelocity == EmptyVector)
         {
@@ -845,7 +844,7 @@ public class RampFix : IModSharpModule, IGameListener
 
         if (overrode)
         {
-            PostTryPlayerMove(mv, tpmOrigin, tpmVelocity);
+            PostTryPlayerMove(mv, ref tpmOrigin, ref tpmVelocity);
         }
     }
 
