@@ -282,6 +282,7 @@ public class RampFix : IModSharpModule, IGameListener
 
     private const float RAMP_BUG_VELOCITY_THRESHOLD = 0.95f;
     private const float RAMP_PIERCE_DISTANCE        = 0.15f;
+    private const int   RAMP_PIERCE_STEPS           = 10;
     private const float NEW_RAMP_THRESHOLD          = 0.95f;
 
     private const           float    FLT_EPSILON      = 1.19209e-07f;
@@ -447,8 +448,9 @@ public class RampFix : IModSharpModule, IGameListener
 
         ref var lastPlane = ref LastValidPlaneNormal[slot]; // single bounds check for the whole method
 
-        // Neither can change while we simulate - we never re-enter engine movement code here.
-        var isWalkingInAir = CBaseEntity_GetMovetype(pawn) == MoveType.Walk && !CBaseEntity_IsOnGround(pawn);
+        // The hook rejects grounded pawns before entering this method, and we do not re-enter
+        // engine movement code while simulating.
+        var isWalkingInAir = CBaseEntity_GetMovetype(pawn) == MoveType.Walk;
 
         var overrodeTpm = false;
 
@@ -507,11 +509,11 @@ public class RampFix : IModSharpModule, IGameListener
                         || !basicValid
                         || !IsTraceEndVerified(pm, &ray, filter, ref verified)))
                 {
-                    var success = false;
-
                     test[0] = default;
 
-                    for (var d = 0; d < 27 && !success; d++)
+                    var offsetDirections = OffsetDirections;
+
+                    for (var d = 0; d < offsetDirections.Length; d++)
                     {
                         Vector offsetDirection;
 
@@ -521,7 +523,7 @@ public class RampFix : IModSharpModule, IGameListener
                         }
                         else
                         {
-                            offsetDirection = OffsetDirections[d]; // precomputed unit vector
+                            offsetDirection = offsetDirections[d]; // precomputed unit vector
 
                             if (lastN.Dot(offsetDirection) <= 0.0f)
                             {
@@ -540,8 +542,9 @@ public class RampFix : IModSharpModule, IGameListener
                         var goodTrace   = false;
                         var hitNewPlane = false;
 
-                        for (var ratio = 0.1f; ratio <= 1.0f; ratio += 0.1f)
+                        for (var step = 1; step <= RAMP_PIERCE_STEPS; step++)
                         {
+                            var ratio        = step * (1.0f / RAMP_PIERCE_STEPS);
                             var pierceOffset = offsetDirection * (ratio * RAMP_PIERCE_DISTANCE);
                             var ratioStart   = start + pierceOffset;
                             var ratioEnd     = end   + pierceOffset;
@@ -558,7 +561,9 @@ public class RampFix : IModSharpModule, IGameListener
                                 continue;
                             }
 
-                            if (MathF.Abs(pierce->Fraction - 1.0f) < FLT_EPSILON * 4.0f)
+                            var pierceFraction = pierce->Fraction;
+
+                            if (MathF.Abs(pierceFraction - 1.0f) < FLT_EPSILON * 4.0f)
                             {
                                 if (VerifyTraceEndNotStuck(pierce, &ray, filter))
                                 {
@@ -570,13 +575,14 @@ public class RampFix : IModSharpModule, IGameListener
                             }
 
                             var pierceN = pierce->PlaneNormal.Normalized();
+                            var lastPlaneDot = pierceN.Dot(lastN);
 
-                            var validPlane = pierce->Fraction      < 1.0f
-                                             && pierce->Fraction   > 0.1f
-                                             && pierceN.Dot(lastN) >= RAMP_BUG_THRESHOLD;
+                            var validPlane = pierceFraction < 1.0f
+                                             && pierceFraction > 0.1f
+                                             && lastPlaneDot  >= RAMP_BUG_THRESHOLD;
 
-                            var wouldHitNewPlane = pmN.Dot(pierceN)      < NEW_RAMP_THRESHOLD
-                                                   && lastN.Dot(pierceN) > NEW_RAMP_THRESHOLD;
+                            var wouldHitNewPlane = lastPlaneDot       > NEW_RAMP_THRESHOLD
+                                                   && pmN.Dot(pierceN) < NEW_RAMP_THRESHOLD;
 
                             var wouldBeGood = validPlane;
 
@@ -644,11 +650,12 @@ public class RampFix : IModSharpModule, IGameListener
                                 lastPlane       = test->PlaneNormal.Normalized();
                             }
 
-                            success     = true;
                             overrodeTpm = true;
 
                             // *pm's normal was just replaced; lastPlane already holds its unit form.
                             pmN = lastPlane;
+
+                            break;
                         }
                     }
                 }
