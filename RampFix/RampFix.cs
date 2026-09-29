@@ -131,26 +131,8 @@ public class RampFix : IModSharpModule, IGameListener
         => *(uint*) (entity + CBaseEntity_m_hGroundEntityOffset) != uint.MaxValue;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe InteractionLayers CBaseEntity_GetInteractsWithLayers(nint entity)
-    {
-        var collision = *(nint*) (entity + CBaseEntity_m_pCollisionOffset);
-
-        return *(InteractionLayers*)
-            (collision
-             + CCollisionProperty_m_collisionAttributeOffset
-             + VPhysicsCollisionAttribute_t_m_nInteractsWithOffset);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe ushort CBaseEntity_GetHierarchyId(nint entity)
-    {
-        var collision = *(nint*) (entity + CBaseEntity_m_pCollisionOffset);
-
-        return *(ushort*)
-            (collision
-             + CCollisionProperty_m_collisionAttributeOffset
-             + VPhysicsCollisionAttribute_t_m_nHierarchyIdOffset);
-    }
+    private static unsafe nint CBaseEntity_GetCollisionAttribute(nint entity)
+        => *(nint*) (entity + CBaseEntity_m_pCollisionOffset) + CCollisionProperty_m_collisionAttributeOffset;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe uint CBaseEntity_GetRefHandle(nint entity)
@@ -161,7 +143,7 @@ public class RampFix : IModSharpModule, IGameListener
             return uint.MaxValue;
 
         var handle = *(uint*) (identity + 0x10);
-        var flags  = *(uint*) (entity   + 0x30);
+        var flags  = *(uint*) (identity + 0x30);
 
         var lo     = handle != 0xFFFFFFFF ? handle & 0x7FFF : 0x7FFF;
         var hi     = (handle >> 15) - (flags & 0x1) << 15;
@@ -231,6 +213,32 @@ public class RampFix : IModSharpModule, IGameListener
                                                CGameTrace*    trace)
     {
         TraceShape(g_pPhysicsQuery, ray, start, end, filter, trace);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static TraceShapeRay CreatePlayerHullRay(nint service)
+        => new (new TraceShapeHull
+        {
+            Mins = new (-16, -16, 0),
+            Maxs = new (16, 16, CCSPlayer_MovementServices_IsDucked(service) ? 54.0f : 72.0f),
+        });
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void InitPlayerMovementFilter(CTraceFilter* filter, nint pawn, bool iterateEntities)
+    {
+        var collisionAttribute = CBaseEntity_GetCollisionAttribute(pawn);
+
+        *filter = default;
+
+        filter->QueryAttribute = RnQueryShapeAttr.PlayerMovement(
+            *(InteractionLayers*) (collisionAttribute + VPhysicsCollisionAttribute_t_m_nInteractsWithOffset));
+
+        filter->QueryAttribute.m_nEntityIdsToIgnore[0] = CBaseEntity_GetRefHandle(pawn);
+        filter->QueryAttribute.m_nHierarchyIds[0]
+            = *(ushort*) (collisionAttribute + VPhysicsCollisionAttribute_t_m_nHierarchyIdOffset);
+
+        filter->Vtable             = (CTraceFilterVirtualTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
+        filter->m_bIterateEntities = iterateEntities;
     }
 
     public void OnServerInit()
@@ -320,7 +328,7 @@ public class RampFix : IModSharpModule, IGameListener
 
         if (!DidTpm[slot])
         {
-            LastValidPlaneNormal[slot] = new ();
+            LastValidPlaneNormal[slot] = default;
         }
     }
 
@@ -408,12 +416,9 @@ public class RampFix : IModSharpModule, IGameListener
                                                 out Vector  tpmOrigin,
                                                 out Vector  tpmVelocity)
     {
-        var frameTime = *(float*) (g_pGlobalVars + CGlobalVars_FrametimeOffset);
-        var timeLeft  = frameTime;
-        var start     = mv->AbsOrigin;
-        var end       = new Vector();
-
-        var allFraction = 0.0f;
+        var timeLeft = *(float*) (g_pGlobalVars + CGlobalVars_FrametimeOffset);
+        var start    = mv->AbsOrigin;
+        var end      = new Vector();
 
         var velocity       = mv->Velocity;
         var primalVelocity = velocity;
@@ -423,22 +428,10 @@ public class RampFix : IModSharpModule, IGameListener
         var pm     = stackalloc CGameTrace[1];
         var pierce = stackalloc CGameTrace[1];
 
-        var ray = new TraceShapeRay(new TraceShapeHull
-        {
-            Mins = new (-16, -16, 0),
-            Maxs = new (16, 16, CCSPlayer_MovementServices_IsDucked(service) ? 54.0f : 72.0f),
-        });
+        var ray = CreatePlayerHullRay(service);
 
-        var filter    = stackalloc CTraceFilter[1];
-        *filter = default;
-
-        var attribute = RnQueryShapeAttr.PlayerMovement(CBaseEntity_GetInteractsWithLayers(pawn));
-
-        attribute.m_nEntityIdsToIgnore[0] = CBaseEntity_GetRefHandle(pawn);
-        attribute.m_nHierarchyIds[0]      = CBaseEntity_GetHierarchyId(pawn);
-
-        filter->QueryAttribute = attribute;
-        filter->Vtable         = (CTraceFilterVirtualTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
+        var filter = stackalloc CTraceFilter[1];
+        InitPlayerMovementFilter(filter, pawn, iterateEntities: false);
 
         var numPlanes = 0;
 
@@ -482,6 +475,11 @@ public class RampFix : IModSharpModule, IGameListener
 
                 if (basicValid && MathF.Abs(pm->Fraction - 1.0f) < FLT_EPSILON)
                 {
+                    if (lastPlane == default && pm->PlaneNormal.LengthSqr() <= 0.99f * 0.99f)
+                    {
+                        break;
+                    }
+
                     verified = VerifyTraceEndNotStuck(pm, &ray, filter) ? 1 : 0;
 
                     if (verified == 1)
@@ -586,13 +584,8 @@ public class RampFix : IModSharpModule, IGameListener
 
                             var wouldBeGood = validPlane;
 
-                            // ...then pay for the two verification traces only when this
-                            // iteration's outcome can actually change anything. If it can't
-                            // break the loop (wouldBeGood == false) and wouldn't change the
-                            // tracked hitNewPlane flag, then whether the verification passes
-                            // (flag set to the same value) or fails (flag left untouched) the
-                            // result is identical - so the traces are pure waste. This keeps
-                            // accept/reject behaviour bit-identical to the original.
+                            // Verify only to accept a good trace or change the fallback flag.
+                            // When the flag stays set, retain its already verified candidate.
                             if (!wouldBeGood && wouldHitNewPlane == hitNewPlane)
                             {
                                 continue;
@@ -610,10 +603,27 @@ public class RampFix : IModSharpModule, IGameListener
                             {
                                 break;
                             }
+
+                            if (hitNewPlane)
+                            {
+                                // test is free until the final connecting trace. Keep the candidate
+                                // there and use the other buffer for subsequent pierce attempts.
+                                var scratch = test;
+                                test   = pierce;
+                                pierce = scratch;
+                            }
                         }
 
                         if (goodTrace || hitNewPlane)
                         {
+                            if (!goodTrace)
+                            {
+                                // Restore the saved candidate before test becomes scratch again.
+                                var scratch = pierce;
+                                pierce = test;
+                                test   = scratch;
+                            }
+
                             TracePlayerBBox(&pierce->EndPosition, &end, &ray, filter, test);
 
                             if (!IsValidMovementTrace(test, &ray, filter))
@@ -675,21 +685,21 @@ public class RampFix : IModSharpModule, IGameListener
             // original: fraction * |velocity| > 0.03125 - squared to avoid the sqrt
             if (fraction * fraction * velocity.LengthSqr() > 0.03125f * 0.03125f || fraction > 0.03125f)
             {
-                allFraction += fraction;
-                start       =  pm->EndPosition;
-                numPlanes   =  0;
+                start     = pm->EndPosition;
+                numPlanes = 0;
             }
 
-            if (MathF.Abs(allFraction - 1.0f) < FLT_EPSILON)
+            if (MathF.Abs(fraction - 1.0f) < FLT_EPSILON)
             {
                 break;
             }
 
-            timeLeft -= frameTime * pm->Fraction;
+            // Fraction is relative to this sweep's remaining time.
+            timeLeft -= timeLeft * fraction;
 
-            if (numPlanes >= 5 || (pm->PlaneNormal.Z >= 0.7f && velocity.Length2D() < 1.0f))
+            if (numPlanes >= 5 || (pm->PlaneNormal.Z >= 0.7f && velocity.Length2DSqr() < 1.0f))
             {
-                velocity = EmptyVector;
+                velocity = default;
 
                 break;
             }
@@ -742,7 +752,7 @@ public class RampFix : IModSharpModule, IGameListener
                     // go along the crease
                     if (numPlanes != 2)
                     {
-                        velocity = EmptyVector;
+                        velocity = default;
 
                         break;
                     }
@@ -752,7 +762,7 @@ public class RampFix : IModSharpModule, IGameListener
 
                     if (velocity.Dot(primalVelocity) <= 0)
                     {
-                        velocity = EmptyVector;
+                        velocity = default;
 
                         break;
                     }
@@ -766,11 +776,9 @@ public class RampFix : IModSharpModule, IGameListener
         return overrodeTpm;
     }
 
-    private static readonly Vector EmptyVector = new ();
-
     private static unsafe void PostTryPlayerMove(MoveData* mv, ref Vector tpmOrigin, ref Vector tpmVelocity)
     {
-        if (tpmOrigin == EmptyVector || tpmVelocity == EmptyVector)
+        if (tpmOrigin == default || tpmVelocity == default)
         {
             return;
         }
@@ -889,23 +897,10 @@ public class RampFix : IModSharpModule, IGameListener
             goto original;
         }
 
-        var ray = new TraceShapeRay(new TraceShapeHull
-        {
-            Mins = new (-16, -16, 0),
-            Maxs = new (16, 16, CCSPlayer_MovementServices_IsDucked(servicePtr) ? 54.0f : 72.0f),
-        });
+        var ray = CreatePlayerHullRay(servicePtr);
 
         var filter = stackalloc CTraceFilter[1];
-        *filter = default;
-
-        var attribute = RnQueryShapeAttr.PlayerMovement(CBaseEntity_GetInteractsWithLayers(outer));
-
-        attribute.m_nEntityIdsToIgnore[0] = CBaseEntity_GetRefHandle(outer);
-        attribute.m_nHierarchyIds[0]      = CBaseEntity_GetHierarchyId(outer);
-
-        filter->QueryAttribute     = attribute;
-        filter->Vtable             = (CTraceFilterVirtualTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
-        filter->m_bIterateEntities = true;
+        InitPlayerMovementFilter(filter, outer, iterateEntities: true);
 
         var origin       = mv->AbsOrigin;
         var groundOrigin = origin;
