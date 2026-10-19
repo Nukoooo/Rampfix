@@ -4,10 +4,10 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared;
 using Sharp.Shared.Enums;
-using Sharp.Shared.HookParams;
 using Sharp.Shared.Hooks;
 using Sharp.Shared.Listeners;
 using Sharp.Shared.Managers;
+using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using Sharp.Shared.Units;
 
@@ -22,27 +22,33 @@ public class RampFix : IModSharpModule, IGameListener
 
     private readonly IDetourHook      _tryPlayerMoveHook;
     private readonly IDetourHook      _categorizePositionHook;
+    private readonly IDetourHook      _tracePlayerBBoxHook;
     private readonly ILogger<RampFix> _logger;
 
     private static unsafe delegate* unmanaged<nint, MoveData*, Vector*, CGameTrace*, bool*, void>
         CCSPlayer_MovementService_TryPlayerMoveOriginal;
     private static unsafe delegate* unmanaged<nint, MoveData*, bool, void> CCSPlayer_MovementService_CategorizePositionOrigin;
 
+    private static unsafe delegate* unmanaged<nint, CGameTrace*, Vector*, Vector*, TraceShapeHull*, CTraceFilter*, void>
+        TracePlayerBBoxOriginal;
+
     private static unsafe delegate* unmanaged[SuppressGCTransition]<IntPtr, TraceShapeRay*, Vector*, Vector*,
         CTraceFilter*, CGameTrace*, bool> TraceShape;
 
     private static nint g_pPhysicsQuery = 0;
 
-    private readonly IGameData    _gameData;
-    private readonly IHookManager _hookManager;
+    private readonly IGameData      _gameData;
+    private readonly IHookManager   _hookManager;
+    private readonly IConVarManager _conVarManager;
 
     private static IModSharp _modSharp;
+
+    private IConVar? _standableNormal;
 
     private static nint CTraceFilterPlayerMovementCS_vtable;
 
     private static int CPlayerPawnComponent_ChainEntityOffset;
     private static int CBaseEntity_m_lifestateOffset;
-    private static int CBaseEntity_m_MoveTypeOffset;
     private static int CBaseEntity_m_hGroundEntityOffset;
     private static int CBaseEntity_m_pCollisionOffset;
     private static int CCollisionProperty_m_collisionAttributeOffset;
@@ -65,7 +71,8 @@ public class RampFix : IModSharpModule, IGameListener
         var factory = sharedSystem.GetLoggerFactory();
         _logger = factory.CreateLogger<RampFix>();
 
-        _hookManager = sharedSystem.GetHookManager();
+        _hookManager   = sharedSystem.GetHookManager();
+        _conVarManager = sharedSystem.GetConVarManager();
 
         _modSharp = sharedSystem.GetModSharp();
         _gameData = _modSharp.GetGameData();
@@ -76,12 +83,12 @@ public class RampFix : IModSharpModule, IGameListener
 
         _tryPlayerMoveHook      = _hookManager.CreateDetourHook();
         _categorizePositionHook = _hookManager.CreateDetourHook();
+        _tracePlayerBBoxHook    = _hookManager.CreateDetourHook();
 
         var schemaManager = sharedSystem.GetSchemaManager();
 
         CPlayerPawnComponent_ChainEntityOffset = schemaManager.GetNetVarOffset("CPlayerPawnComponent", "__m_pChainEntity");
         CBaseEntity_m_lifestateOffset          = schemaManager.GetNetVarOffset("CBaseEntity", "m_lifeState");
-        CBaseEntity_m_MoveTypeOffset           = schemaManager.GetNetVarOffset("CBaseEntity", "m_MoveType");
         CBaseEntity_m_hGroundEntityOffset      = schemaManager.GetNetVarOffset("CBaseEntity", "m_hGroundEntity");
         CBaseEntity_m_pCollisionOffset         = schemaManager.GetNetVarOffset("CBaseEntity", "m_pCollision");
         CBasePlayerPawn_m_hControllerOffset    = schemaManager.GetNetVarOffset("CBasePlayerPawn", "m_hController");
@@ -123,10 +130,6 @@ public class RampFix : IModSharpModule, IGameListener
         => *(LifeState*) (entity + CBaseEntity_m_lifestateOffset) == LifeState.Alive;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe MoveType CBaseEntity_GetMovetype(nint entity)
-        => *(MoveType*) (entity + CBaseEntity_m_MoveTypeOffset);
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe bool CBaseEntity_IsOnGround(nint entity)
         => *(uint*) (entity + CBaseEntity_m_hGroundEntityOffset) != uint.MaxValue;
 
@@ -156,7 +159,7 @@ public class RampFix : IModSharpModule, IGameListener
     {
         _gameData.Register("rampfix.games");
 
-        if (!_modSharp.GetGameData().GetAddress("CGamePhysicsQueryInterface::TraceShape", out var address))
+        if (!_gameData.GetAddress("CGamePhysicsQueryInterface::TraceShape", out var address))
         {
             _logger.LogInformation("Failed to get address for CGamePhysicsQueryInterface::TraceShape");
 
@@ -166,7 +169,7 @@ public class RampFix : IModSharpModule, IGameListener
         TraceShape = (delegate* unmanaged[SuppressGCTransition]<IntPtr, TraceShapeRay*, Vector*, Vector*, CTraceFilter*,
             CGameTrace*, bool>) address;
 
-        if (!_modSharp.GetGameData().GetAddress("g_pPhysicsQuery", out address))
+        if (!_gameData.GetAddress("g_pPhysicsQuery", out address))
         {
             _logger.LogInformation("Failed to get address for g_pPhysicsQuery");
 
@@ -174,6 +177,10 @@ public class RampFix : IModSharpModule, IGameListener
         }
 
         g_pPhysicsQuery = address;
+
+        _tracePlayerBBoxHook.Prepare("TracePlayerBBox",
+                                     (nint) (delegate* unmanaged<nint, CGameTrace*, Vector*, Vector*, TraceShapeHull*,
+                                         CTraceFilter*, void>) (&hk_TracePlayerBBox));
 
         _tryPlayerMoveHook.Prepare("CCSPlayer_MovementService::TryPlayerMove",
                                    (nint) (delegate* unmanaged<nint, MoveData*, Vector*, CGameTrace*, bool*, void>)
@@ -183,34 +190,65 @@ public class RampFix : IModSharpModule, IGameListener
                                         (nint) (delegate* unmanaged<nint, MoveData*, bool, void>)
                                         (&hk_CCSPlayer_MovementService_CategorizePosition));
 
-        if (_tryPlayerMoveHook.Install())
+        if (!_tracePlayerBBoxHook.Install())
         {
-            CCSPlayer_MovementService_TryPlayerMoveOriginal
-                = (delegate* unmanaged<nint, MoveData*, Vector*, CGameTrace*, bool*, void>) _tryPlayerMoveHook.Trampoline;
+            _logger.LogInformation("Failed to hook TracePlayerBBox");
+
+            return false;
         }
 
-        if (_categorizePositionHook.Install())
+        TracePlayerBBoxOriginal
+            = (delegate* unmanaged<nint, CGameTrace*, Vector*, Vector*, TraceShapeHull*, CTraceFilter*, void>)
+            _tracePlayerBBoxHook.Trampoline;
+
+        if (!_tryPlayerMoveHook.Install())
         {
-            CCSPlayer_MovementService_CategorizePositionOrigin
-                = (delegate* unmanaged<nint, MoveData*, bool, void>) _categorizePositionHook.Trampoline;
+            _logger.LogInformation("Failed to hook CCSPlayer_MovementService::TryPlayerMove");
 
-            _hookManager.PlayerProcessMovePre.InstallForward(OnPreProcessMovement);
-            _hookManager.PlayerProcessMovePost.InstallForward(OnPostProcessMovement);
-
-            _modSharp.InstallGameListener(this);
-
-            return true;
+            return false;
         }
 
-        return false;
+        CCSPlayer_MovementService_TryPlayerMoveOriginal
+            = (delegate* unmanaged<nint, MoveData*, Vector*, CGameTrace*, bool*, void>) _tryPlayerMoveHook.Trampoline;
+
+        if (!_categorizePositionHook.Install())
+        {
+            _logger.LogInformation("Failed to hook CCSPlayer_MovementService::CategorizePosition");
+
+            return false;
+        }
+
+        CCSPlayer_MovementService_CategorizePositionOrigin
+            = (delegate* unmanaged<nint, MoveData*, bool, void>) _categorizePositionHook.Trampoline;
+
+        _standableNormal = _conVarManager.FindConVar("sv_standable_normal");
+
+        if (_standableNormal is not null)
+        {
+            StandableNormal = _standableNormal.GetFloat();
+            _conVarManager.InstallChangeHook(_standableNormal, OnStandableNormalChanged);
+        }
+        else
+        {
+            _logger.LogWarning("Failed to find sv_standable_normal, using {value}", StandableNormal);
+        }
+
+        _modSharp.InstallGameListener(this);
+
+        return true;
+    }
+
+    private static void OnStandableNormalChanged(IConVar conVar)
+    {
+        StandableNormal = conVar.GetFloat();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void TracePlayerBBox(Vector*        start,
-                                               Vector*        end,
-                                               TraceShapeRay* ray,
-                                               CTraceFilter*  filter,
-                                               CGameTrace*    trace)
+    private static unsafe void TraceHull(Vector*        start,
+                                         Vector*        end,
+                                         TraceShapeRay* ray,
+                                         CTraceFilter*  filter,
+                                         CGameTrace*    trace)
     {
         TraceShape(g_pPhysicsQuery, ray, start, end, filter, trace);
     }
@@ -253,553 +291,65 @@ public class RampFix : IModSharpModule, IGameListener
 
     public void Shutdown()
     {
-        try
+        if (_standableNormal is not null)
         {
-            _hookManager.PlayerProcessMovePre.RemoveForward(OnPreProcessMovement);
-        }
-        catch (Exception)
-        {
-            // ignored
-        }
-
-        try
-        {
-            _hookManager.PlayerProcessMovePost.RemoveForward(OnPostProcessMovement);
-        }
-        catch (Exception)
-        {
-            // ignored
+            _conVarManager.RemoveChangeHook(_standableNormal, OnStandableNormalChanged);
         }
 
         _tryPlayerMoveHook.Uninstall();
         _categorizePositionHook.Uninstall();
+        _tracePlayerBBoxHook.Uninstall();
 
         _tryPlayerMoveHook.Dispose();
         _categorizePositionHook.Dispose();
+        _tracePlayerBBoxHook.Dispose();
 
         _modSharp.RemoveGameListener(this);
     }
 
-    private static readonly Vector[] LastValidPlaneNormal = new Vector[PlayerSlot.MaxPlayerCount];
-    private static readonly bool[]   DidTpm               = new bool[PlayerSlot.MaxPlayerCount];
+    // The game keeps the player this far away from what they collide with.
+    private const float RAMP_BUG_OFFSET          = 0.03125f;
+    private const float RAMP_BUG_THRESHOLD       = 0.999f;
+    private const float RAMP_BUG_SAME_PLANE      = 0.99f;
+    private const float RAMP_BUG_MIN_DISTANCE    = 1.0f;
+    private const float GROUND_CHECK_SHRINK_SIZE = 0.0625f;
 
-    private const float RAMP_BUG_THRESHOLD = 0.98f;
+    // Last plane that TryPlayerMove hit.
+    private static readonly Vector[] LastPlane = new Vector[PlayerSlot.MaxPlayerCount];
 
-    private const float GROUND_PLANE_Z = 0.7f;
-    private const float STRAIGHT_WALL_Z = 0.03125f;
+    private static float StandableNormal = 0.7f;
 
-    private const float RAMP_BUG_VELOCITY_THRESHOLD = 0.95f;
-    private const float RAMP_PIERCE_DISTANCE        = 0.15f;
-    private const int   RAMP_PIERCE_STEPS           = 10;
-    private const float NEW_RAMP_THRESHOLD          = 0.95f;
+    // The player that is currently running TryPlayerMove or CategorizePosition, -1 if none.
+    private static int  _tracingSlot = -1;
+    private static bool _tracingInTryPlayerMove;
 
-    private const           float    FLT_EPSILON      = 1.19209e-07f;
-    private static readonly Vector[] OffsetDirections = BuildOffsetDirections();
-
-    private static Vector[] BuildOffsetDirections()
+    // Every hull trace done by TryPlayerMove and CategorizePosition goes through this function.
+    [UnmanagedCallersOnly]
+    private static unsafe void hk_TracePlayerBBox(nint            traceCache,
+                                                  CGameTrace*     pm,
+                                                  Vector*         start,
+                                                  Vector*         end,
+                                                  TraceShapeHull* bounds,
+                                                  CTraceFilter*   filter)
     {
-        ReadOnlySpan<float> offsets = [0.0f, -1.0f, 1.0f];
+        TracePlayerBBoxOriginal(traceCache, pm, start, end, bounds, filter);
 
-        var dirs = new Vector[27];
+        var slot = _tracingSlot;
 
-        for (var i = 0; i < 3; i++)
-        {
-            for (var j = 0; j < 3; j++)
-            {
-                for (var k = 0; k < 3; k++)
-                {
-                    dirs[i * 9 + j * 3 + k] = new Vector(offsets[i], offsets[j], offsets[k]).Normalized();
-                }
-            }
-        }
-
-        return dirs;
-    }
-
-    private static void OnPreProcessMovement(IPlayerProcessMoveForwardParams obj)
-    {
-        var slot = obj.Client.Slot;
-        DidTpm[slot] = false;
-    }
-
-    private static void OnPostProcessMovement(IPlayerProcessMoveForwardParams obj)
-    {
-        var slot = obj.Client.Slot;
-
-        if (!DidTpm[slot])
-        {
-            LastValidPlaneNormal[slot] = default;
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe bool IsTraceBasicallyValid(CGameTrace* trace)
-    {
-        if (trace->StartInSolid)
-        {
-            return false;
-        }
-
-        if (trace->Fraction                    < 1.0f
-            && MathF.Abs(trace->PlaneNormal.X) < FLT_EPSILON
-            && MathF.Abs(trace->PlaneNormal.Y) < FLT_EPSILON
-            && MathF.Abs(trace->PlaneNormal.Z) < FLT_EPSILON)
-        {
-            return false;
-        }
-
-        if (MathF.Abs(trace->PlaneNormal.X)    > 1.0f
-            || MathF.Abs(trace->PlaneNormal.Y) > 1.0f
-            || MathF.Abs(trace->PlaneNormal.Z) > 1.0f)
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    // The expensive half: two extra native traces verifying the end position
-    // isn't stuck. Split out so hot loops can defer / skip it.
-    [SkipLocalsInit]
-    private static unsafe bool VerifyTraceEndNotStuck(CGameTrace* trace, TraceShapeRay* ray, CTraceFilter* filter)
-    {
-        var stuck = stackalloc CGameTrace[1];
-
-        TracePlayerBBox(&trace->EndPosition, &trace->EndPosition, ray, filter, stuck);
-
-        if (stuck->StartInSolid || stuck->Fraction < 1.0f - FLT_EPSILON)
-        {
-            return false;
-        }
-
-        TracePlayerBBox(&trace->EndPosition, &trace->StartPosition, ray, filter, stuck);
-
-        return !stuck->StartInSolid;
-    }
-
-    private static unsafe bool IsValidMovementTrace(CGameTrace* trace, TraceShapeRay* ray, CTraceFilter* filter)
-        => IsTraceBasicallyValid(trace) && VerifyTraceEndNotStuck(trace, ray, filter);
-
-    // -1 = not traced yet, 0 = stuck, 1 = clear.
-    // Lets the caller put the two traces last in a || chain without ever paying for them twice.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe bool IsTraceEndVerified(CGameTrace*   trace,
-                                                  TraceShapeRay* ray,
-                                                  CTraceFilter*  filter,
-                                                  ref int        cached)
-    {
-        if (cached < 0)
-        {
-            cached = VerifyTraceEndNotStuck(trace, ray, filter) ? 1 : 0;
-        }
-
-        return cached != 0;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ClipVelocity(in Vector @in, in Vector normal, out Vector @out)
-    {
-        var backoff = -((@in.X * normal.X) + ((normal.Z * @in.Z) + (@in.Y * normal.Y)));
-
-        backoff = MathF.Max(backoff, 0.0f) + 0.03125f;
-
-        @out = normal * backoff + @in;
-    }
-
-    [SkipLocalsInit]
-    private static unsafe bool PreTryPlayerMove(nint        service,
-                                                nint        pawn,
-                                                PlayerSlot  slot,
-                                                MoveData*   mv,
-                                                Vector*     pFirstDest,
-                                                CGameTrace* pFirstTrace,
-                                                out Vector  tpmOrigin,
-                                                out Vector  tpmVelocity)
-    {
-        var timeLeft = *(float*) (g_pGlobalVars + CGlobalVars_FrametimeOffset);
-        var start    = mv->AbsOrigin;
-        var end      = new Vector();
-
-        var velocity       = mv->Velocity;
-        var primalVelocity = velocity;
-
-        var potentiallyStuck = false;
-
-        var pm     = stackalloc CGameTrace[1];
-        var pierce = stackalloc CGameTrace[1];
-
-        var ray = CreatePlayerHullRay(service);
-
-        var filter = stackalloc CTraceFilter[1];
-        InitPlayerMovementFilter(filter, pawn, iterateEntities: false);
-
-        var numPlanes = 0;
-
-        var planes = stackalloc Vector[5];
-
-        var test = stackalloc CGameTrace[1];
-
-        ref var lastPlane = ref LastValidPlaneNormal[slot]; // single bounds check for the whole method
-
-        // The hook rejects grounded pawns before entering this method, and we do not re-enter
-        // engine movement code while simulating.
-        var isWalkingInAir = CBaseEntity_GetMovetype(pawn) == MoveType.Walk;
-
-        var overrodeTpm = false;
-
-        for (var bumpCount = 0u; bumpCount < 4; bumpCount++)
-        {
-            end = start + (velocity * timeLeft);
-
-            Vector pmN; // pm->PlaneNormal, unit-length or exactly zero
-
-            if (pFirstDest != null && *pFirstDest == end)
-            {
-                *pm = *pFirstTrace;
-                pmN = pm->PlaneNormal.Normalized();
-            }
-            else
-            {
-                TracePlayerBBox(&start, &end, &ray, filter, pm);
-
-                if (start == end)
-                {
-                    // Nothing left to sweep. start/velocity/timeLeft can no longer change, so every
-                    // remaining bump would re-run this exact degenerate trace and land on the same
-                    // pm - break out instead of burning three more traces on it.
-                    break;
-                }
-
-                var basicValid = IsTraceBasicallyValid(pm);
-                var verified   = -1;
-
-                if (basicValid && MathF.Abs(pm->Fraction - 1.0f) < FLT_EPSILON)
-                {
-                    if (lastPlane == default && pm->PlaneNormal.LengthSqr() <= 0.99f * 0.99f)
-                    {
-                        break;
-                    }
-
-                    verified = VerifyTraceEndNotStuck(pm, &ray, filter) ? 1 : 0;
-
-                    if (verified == 1)
-                    {
-                        break;
-                    }
-                }
-
-                var lastN = lastPlane; // already unit-length, no sqrt
-                pmN = pm->PlaneNormal.Normalized();
-
-                var normalChanged = pmN.Dot(lastN) < RAMP_BUG_THRESHOLD;
-                var stuck         = potentiallyStuck && pm->Fraction == 0.0f;
-
-                // A vertical wall is never the ramp we are trying to dodge.
-                var lastValidPlaneWasStraightWall = lastN.Z < STRAIGHT_WALL_Z;
-
-                // (normalChanged && !straightWall) || stuck is the reference trigger; an invalid
-                // trace counts as a candidate too. The verification traces are the expensive half
-                // of IsValidMovementTrace, so they go last in the chain - every cheaper term that
-                // short-circuits first now skips them entirely, with the same accept/reject result.
-                if (lastN != default
-                    && (normalChanged && !lastValidPlaneWasStraightWall
-                        || stuck
-                        || !basicValid
-                        || !IsTraceEndVerified(pm, &ray, filter, ref verified)))
-                {
-                    test[0] = default;
-
-                    var offsetDirections = OffsetDirections;
-
-                    for (var d = 0; d < offsetDirections.Length; d++)
-                    {
-                        Vector offsetDirection;
-
-                        if (d == 0)
-                        {
-                            offsetDirection = lastN;
-                        }
-                        else
-                        {
-                            offsetDirection = offsetDirections[d]; // precomputed unit vector
-
-                            if (lastN.Dot(offsetDirection) <= 0.0f)
-                            {
-                                continue;
-                            }
-
-                            var testStart = start + offsetDirection * RAMP_PIERCE_DISTANCE;
-                            TracePlayerBBox(&testStart, &start, &ray, filter, test);
-
-                            if (!IsValidMovementTrace(test, &ray, filter))
-                            {
-                                continue;
-                            }
-                        }
-
-                        var goodTrace   = false;
-                        var hitNewPlane = false;
-
-                        for (var step = 1; step <= RAMP_PIERCE_STEPS; step++)
-                        {
-                            var ratio        = step * (1.0f / RAMP_PIERCE_STEPS);
-                            var pierceOffset = offsetDirection * (ratio * RAMP_PIERCE_DISTANCE);
-                            var ratioStart   = start + pierceOffset;
-                            var ratioEnd     = end   + pierceOffset;
-
-                            TracePlayerBBox(&ratioStart,
-                                            &ratioEnd,
-                                            &ray,
-                                            filter,
-                                            pierce);
-
-                            // Cheap, trace-free checks first...
-                            if (!IsTraceBasicallyValid(pierce))
-                            {
-                                continue;
-                            }
-
-                            var pierceFraction = pierce->Fraction;
-
-                            if (MathF.Abs(pierceFraction - 1.0f) < FLT_EPSILON * 4.0f)
-                            {
-                                if (VerifyTraceEndNotStuck(pierce, &ray, filter))
-                                {
-                                    goodTrace = true;
-                                    break;
-                                }
-
-                                continue;
-                            }
-
-                            var pierceN = pierce->PlaneNormal.Normalized();
-                            var lastPlaneDot = pierceN.Dot(lastN);
-
-                            var validPlane = pierceFraction < 1.0f
-                                             && pierceFraction > 0.1f
-                                             && lastPlaneDot  >= RAMP_BUG_THRESHOLD;
-
-                            var wouldHitNewPlane = lastPlaneDot       > NEW_RAMP_THRESHOLD
-                                                   && pmN.Dot(pierceN) < NEW_RAMP_THRESHOLD;
-
-                            var wouldBeGood = validPlane;
-
-                            // Verify only to accept a good trace or change the fallback flag.
-                            // When the flag stays set, retain its already verified candidate.
-                            if (!wouldBeGood && wouldHitNewPlane == hitNewPlane)
-                            {
-                                continue;
-                            }
-
-                            if (!VerifyTraceEndNotStuck(pierce, &ray, filter))
-                            {
-                                continue;
-                            }
-
-                            hitNewPlane = wouldHitNewPlane;
-                            goodTrace   = wouldBeGood;
-
-                            if (goodTrace)
-                            {
-                                break;
-                            }
-
-                            if (hitNewPlane)
-                            {
-                                // test is free until the final connecting trace. Keep the candidate
-                                // there and use the other buffer for subsequent pierce attempts.
-                                var scratch = test;
-                                test   = pierce;
-                                pierce = scratch;
-                            }
-                        }
-
-                        if (goodTrace || hitNewPlane)
-                        {
-                            if (!goodTrace)
-                            {
-                                // Restore the saved candidate before test becomes scratch again.
-                                var scratch = pierce;
-                                pierce = test;
-                                test   = scratch;
-                            }
-
-                            TracePlayerBBox(&pierce->EndPosition, &end, &ray, filter, test);
-
-                            if (!IsValidMovementTrace(test, &ray, filter))
-                            {
-                                continue;
-                            }
-
-                            *pm = *pierce;
-
-                            var denomSq = (end - start).LengthSqr();
-
-                            if (denomSq > 1e-12f)
-                            {
-                                var deltaSq = (pierce->EndPosition - pierce->StartPosition).LengthSqr();
-
-                                // sqrt(a)/sqrt(b) == sqrt(a/b): one sqrt instead of two
-                                pm->Fraction = Math.Clamp(MathF.Sqrt(deltaSq / denomSq), 0.0f, 1.0f);
-                            }
-                            else
-                            {
-                                pm->Fraction = 0.0f;
-                            }
-
-                            pm->EndPosition = test->EndPosition;
-
-                            if (pierce->PlaneNormal.LengthSqr() > 0.0f)
-                            {
-                                pm->PlaneNormal = pierce->PlaneNormal;
-                                lastPlane       = pierce->PlaneNormal.Normalized();
-                            }
-                            else
-                            {
-                                pm->PlaneNormal = test->PlaneNormal;
-                                lastPlane       = test->PlaneNormal.Normalized();
-                            }
-
-                            overrodeTpm = true;
-
-                            // *pm's normal was just replaced; lastPlane already holds its unit form.
-                            pmN = lastPlane;
-
-                            break;
-                        }
-                    }
-                }
-
-                // Gate on the RAW normal being near unit-length: a shorter one is a deformed plane
-                // we must not start tracking. (Length() > 0.99f, squared to avoid the sqrt.)
-                if (pm->PlaneNormal.LengthSqr() > 0.99f * 0.99f)
-                {
-                    lastPlane = pmN;
-                }
-
-                potentiallyStuck = pm->Fraction == 0.0f;
-            }
-
-            var fraction = pm->Fraction;
-
-            // original: fraction * |velocity| > 0.03125 - squared to avoid the sqrt
-            if (fraction * fraction * velocity.LengthSqr() > 0.03125f * 0.03125f || fraction > 0.03125f)
-            {
-                start     = pm->EndPosition;
-                numPlanes = 0;
-            }
-
-            if (MathF.Abs(fraction - 1.0f) < FLT_EPSILON)
-            {
-                break;
-            }
-
-            // Fraction is relative to this sweep's remaining time.
-            timeLeft -= timeLeft * fraction;
-
-            if (numPlanes >= 5 || (pm->PlaneNormal.Z >= 0.7f && velocity.Length2DSqr() < 1.0f))
-            {
-                velocity = default;
-
-                break;
-            }
-
-            planes[numPlanes] = pmN;
-            numPlanes++;
-
-            if (numPlanes == 1 && isWalkingInAir)
-            {
-                ClipVelocity(velocity, planes[0], out velocity);
-            }
-            else
-            {
-                int i;
-
-                for (i = 0; i < numPlanes; i++)
-                {
-                    ClipVelocity(velocity, planes[i], out velocity);
-
-                    int j;
-
-                    for (j = 0; j < numPlanes; j++)
-                    {
-                        if (j == i)
-                        {
-                            continue;
-                        }
-
-                        // Are we now moving against this plane?
-                        if (velocity.Dot(planes[j]) < 0)
-                        {
-                            break; // not ok
-                        }
-                    }
-
-                    if (j == numPlanes) // Didn't have to clip, so we're ok
-                    {
-                        break;
-                    }
-                }
-
-                // Did we go all the way through plane set
-                if (i != numPlanes)
-                {
-                    // go along this plane
-                    // pmove.velocity is set in clipping call, no need to set again.
-                }
-                else
-                {
-                    // go along the crease
-                    if (numPlanes != 2)
-                    {
-                        velocity = default;
-
-                        break;
-                    }
-
-                    var dir = planes[0].Cross(planes[1]).Normalized();
-                    velocity = dir * dir.Dot(velocity);
-
-                    if (velocity.Dot(primalVelocity) <= 0)
-                    {
-                        velocity = default;
-
-                        break;
-                    }
-                }
-            }
-        }
-
-        tpmOrigin   = pm->EndPosition;
-        tpmVelocity = velocity;
-
-        return overrodeTpm;
-    }
-
-    private static unsafe void PostTryPlayerMove(MoveData* mv, ref Vector tpmOrigin, ref Vector tpmVelocity)
-    {
-        if (tpmOrigin == default || tpmVelocity == default)
+        if (slot < 0)
         {
             return;
         }
 
-        var tpmLenSq = tpmVelocity.LengthSqr();
-        var mvLenSq  = mv->Velocity.LengthSqr();
-        var denomSq  = tpmLenSq * mvLenSq;
+        var ray = new TraceShapeRay(*bounds);
 
-        var cos = denomSq > 1e-24f
-            ? tpmVelocity.Dot(mv->Velocity) / MathF.Sqrt(denomSq)
-            : 0.0f;
-
-        var velocityHeavilyModified =
-            cos < RAMP_BUG_THRESHOLD
-            || tpmLenSq > 50.0f                       * 50.0f
-            && mvLenSq  < RAMP_BUG_VELOCITY_THRESHOLD * RAMP_BUG_VELOCITY_THRESHOLD * tpmLenSq;
-
-        if (velocityHeavilyModified)
+        if (_tracingInTryPlayerMove)
         {
-            mv->AbsOrigin = tpmOrigin;
-            mv->Velocity  = tpmVelocity;
+            FixTryPlayerMoveTrace(&ray, *start, *end, filter, pm, ref LastPlane[slot]);
+        }
+        else
+        {
+            FixGroundTrace(&ray, *start, *end, filter, pm);
         }
     }
 
@@ -828,117 +378,202 @@ public class RampFix : IModSharpModule, IGameListener
             return;
         }
 
-        DidTpm[slot] = true;
+        var previousSlot            = _tracingSlot;
+        var previousInTryPlayerMove = _tracingInTryPlayerMove;
 
-        if (mv->Velocity.LengthSqr() == 0)
+        _tracingSlot            = slot;
+        _tracingInTryPlayerMove = true;
+
+        // WalkMove does the first trace before calling TryPlayerMove, so we need to fix that one here.
+        if (pFirstDest != null && pFirstTrace != null && g_pGlobalVars != 0 && CBaseEntity_IsOnGround(outer))
         {
-            CCSPlayer_MovementService_TryPlayerMoveOriginal(servicePtr, mv, pFirstDest, pFirstTrace, pIsSurfing);
-
-            return;
+            FixFirstTrace(servicePtr, outer, slot, mv, pFirstDest, pFirstTrace);
         }
-
-        if (CBaseEntity_IsOnGround(outer))
-        {
-            LastValidPlaneNormal[slot] = default;
-
-            CCSPlayer_MovementService_TryPlayerMoveOriginal(servicePtr, mv, pFirstDest, pFirstTrace, pIsSurfing);
-
-            return;
-        }
-
-        var overrode = PreTryPlayerMove(servicePtr,
-                                        outer,
-                                        slot,
-                                        mv,
-                                        pFirstDest,
-                                        pFirstTrace,
-                                        out var tpmOrigin,
-                                        out var tpmVelocity);
 
         CCSPlayer_MovementService_TryPlayerMoveOriginal(servicePtr, mv, pFirstDest, pFirstTrace, pIsSurfing);
 
-        if (overrode)
+        _tracingSlot            = previousSlot;
+        _tracingInTryPlayerMove = previousInTryPlayerMove;
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void FixFirstTrace(nint        service,
+                                             nint        pawn,
+                                             byte        slot,
+                                             MoveData*   mv,
+                                             Vector*     pFirstDest,
+                                             CGameTrace* pFirstTrace)
+    {
+        var frametime = *(float*) (g_pGlobalVars + CGlobalVars_FrametimeOffset);
+        var origin    = mv->AbsOrigin;
+        var end       = origin + (mv->Velocity * frametime);
+
+        // TryPlayerMove only uses it if it ends exactly where its own first trace would end.
+        // Vector's == has a tolerance, so compare the components directly.
+        if (end.X != pFirstDest->X || end.Y != pFirstDest->Y || end.Z != pFirstDest->Z)
         {
-            PostTryPlayerMove(mv, ref tpmOrigin, ref tpmVelocity);
+            return;
         }
+
+        var ray = CreatePlayerHullRay(service);
+
+        var filter = stackalloc CTraceFilter[1];
+        InitPlayerMovementFilter(filter, pawn, iterateEntities: true);
+
+        FixTryPlayerMoveTrace(&ray, origin, end, filter, pFirstTrace, ref LastPlane[slot]);
     }
 
     [UnmanagedCallersOnly]
-    [SkipLocalsInit]
     private static unsafe void hk_CCSPlayer_MovementService_CategorizePosition(nint      servicePtr,
                                                                                MoveData* mv,
                                                                                bool      stayOnGround)
     {
-        if (stayOnGround || mv->Velocity.Z > -64.0f)
+        var outer = CPlayerPawnComponent_GetOuter(servicePtr);
+
+        if (outer == nint.Zero || !CBaseEntity_IsAlive(outer))
         {
             CCSPlayer_MovementService_CategorizePositionOrigin(servicePtr, mv, stayOnGround);
 
             return;
         }
 
-        var outer = CPlayerPawnComponent_GetOuter(servicePtr);
-
-        if (outer == nint.Zero || !CBaseEntity_IsAlive(outer))
-        {
-            goto original;
-        }
-
         var slot = CBasePlayerPawn_GetPlayerSlot(outer);
 
         if (slot == byte.MaxValue)
         {
-            goto original;
+            CCSPlayer_MovementService_CategorizePositionOrigin(servicePtr, mv, stayOnGround);
+
+            return;
         }
 
-        var lastN = LastValidPlaneNormal[slot]; // invariant: unit-length or zero
+        var previousSlot            = _tracingSlot;
+        var previousInTryPlayerMove = _tracingInTryPlayerMove;
 
-        if (lastN == default || lastN.Z > GROUND_PLANE_Z)
+        _tracingSlot            = slot;
+        _tracingInTryPlayerMove = false;
+
+        CCSPlayer_MovementService_CategorizePositionOrigin(servicePtr, mv, stayOnGround);
+
+        _tracingSlot            = previousSlot;
+        _tracingInTryPlayerMove = previousInTryPlayerMove;
+    }
+
+    /*
+        Rampbug fix:
+        The game keeps the player 1/32 unit away from whatever they collide with.
+        While sliding on a ramp, the player can end up closer to the ramp than that, or collide with the edge between two triangles of the ramp
+        instead of the ramp itself, which gives a wrong normal. TryPlayerMove then either stops the player or sends them in a random direction.
+
+        To fix this, we redo the trace a bit further away from the ramp. We only use that trace if it actually goes further than the original one.
+        If it just ends up on another plane right away, the player is really running into a corner and the original trace is kept.
+    */
+    [SkipLocalsInit]
+    private static unsafe void FixTryPlayerMoveTrace(TraceShapeRay* ray,
+                                                     Vector         start,
+                                                     Vector         end,
+                                                     CTraceFilter*  filter,
+                                                     CGameTrace*    pm,
+                                                     ref Vector     lastPlane)
+    {
+        var direction = end - start;
+        var length    = direction.Length();
+
+        if (length > 0.0f)
         {
-            goto original;
+            direction *= 1.0f / length;
         }
 
-        var ray = CreatePlayerHullRay(servicePtr);
+        // We hit a plane that will change our velocity, or we barely moved at all. This is either a real obstacle or a rampbug.
+        if (pm->Fraction < 1.0f
+            && !pm->StartInSolid
+            && lastPlane.LengthSqr() > 0.0f
+            && length                > 0.0f
+            && (pm->PlaneNormal.Dot(lastPlane) < RAMP_BUG_THRESHOLD || pm->Fraction * length < RAMP_BUG_OFFSET))
+        {
+            var trace = stackalloc CGameTrace[1];
 
-        var filter = stackalloc CTraceFilter[1];
-        InitPlayerMovementFilter(filter, outer, iterateEntities: true);
+            // This can only be a rampbug if the player is still right next to the last plane they hit.
+            var testStart = pm->EndPosition + (lastPlane * RAMP_BUG_OFFSET);
+            var testEnd   = pm->EndPosition - (lastPlane * (RAMP_BUG_OFFSET * 2.0f));
+            TraceHull(&testStart, &testEnd, ray, filter, trace);
 
-        var origin       = mv->AbsOrigin;
-        var groundOrigin = origin;
-        groundOrigin.Z -= 2.0f;
+            if (trace->Fraction < 1.0f && !trace->StartInSolid && trace->PlaneNormal.Dot(lastPlane) >= RAMP_BUG_THRESHOLD)
+            {
+                // Redo the trace a bit further away from the plane.
+                var offset      = lastPlane * RAMP_BUG_OFFSET;
+                var offsetStart = start + offset;
+                var offsetEnd   = end   + offset;
+                TraceHull(&offsetStart, &offsetEnd, ray, filter, trace);
+
+                // If this trace only goes a bit further and then hits a different plane, the original trace hit something real,
+                // like a corner or two ramps meeting each other. Keep the original so TryPlayerMove can slide along both planes.
+                var distance  = (trace->EndPosition - pm->EndPosition).Dot(direction);
+                var samePlane = trace->PlaneNormal.Dot(lastPlane) >= RAMP_BUG_SAME_PLANE;
+
+                if (!trace->StartInSolid
+                    && distance > RAMP_BUG_OFFSET
+                    && (trace->Fraction == 1.0f || distance > RAMP_BUG_MIN_DISTANCE || samePlane))
+                {
+                    *pm = *trace;
+                }
+            }
+        }
+
+        FixGroundTrace(ray, start, end, filter, pm);
+
+        if (pm->Fraction < 1.0f && !pm->StartInSolid && pm->PlaneNormal.LengthSqr() > 0.98f)
+        {
+            lastPlane = pm->PlaneNormal;
+        }
+    }
+
+    // Sometimes the game thinks the player is on standable ground while they are actually on a steep slope right below a wall.
+    // A slightly smaller hull doesn't have this problem and will hit the slope instead.
+    // It will also hit a slope if the player is standing over a gap between two floors though, so we make sure there's a wall next to the player.
+    [SkipLocalsInit]
+    private static unsafe void FixGroundTrace(TraceShapeRay* ray,
+                                              Vector         start,
+                                              Vector         end,
+                                              CTraceFilter*  filter,
+                                              CGameTrace*    pm)
+    {
+        var standableZ = StandableNormal;
+
+        if (pm->Fraction == 1.0f || pm->StartInSolid || pm->PlaneNormal.Z < standableZ)
+        {
+            return;
+        }
+
+        var shrink   = new Vector(GROUND_CHECK_SHRINK_SIZE, GROUND_CHECK_SHRINK_SIZE, 0.0f);
+        var smallRay = new TraceShapeRay(new TraceShapeHull { Mins = ray->Hull.Mins + shrink, Maxs = ray->Hull.Maxs - shrink });
 
         var trace = stackalloc CGameTrace[1];
+        TraceHull(&start, &end, &smallRay, filter, trace);
 
-        TracePlayerBBox(&origin, &groundOrigin, &ray, filter, trace);
-
-        if (MathF.Abs(trace->Fraction - 1.0f) < FLT_EPSILON)
+        if (trace->Fraction == 1.0f || trace->StartInSolid || trace->PlaneNormal.Z >= standableZ)
         {
-            goto original;
+            return;
         }
 
-        if (trace->Fraction                               < 0.95f
-            && trace->PlaneNormal.Z                       > GROUND_PLANE_Z
-            && lastN.Dot(trace->PlaneNormal.Normalized()) < RAMP_BUG_THRESHOLD)
+        var slopeNormal = trace->PlaneNormal;
+
+        // Is there a wall on the side that the slope goes up towards?
+        var wallDirection = new Vector(-slopeNormal.X, -slopeNormal.Y, 0.0f);
+        wallDirection.Normalize();
+
+        if (wallDirection.LengthSqr() == 0.0f)
         {
-            origin         += lastN * 0.0625f;
-            groundOrigin   =  origin;
-            groundOrigin.Z -= 2.0f;
-
-            TracePlayerBBox(&origin, &groundOrigin, &ray, filter, trace);
-
-            if (trace->StartInSolid)
-            {
-                goto original;
-            }
-
-            if (MathF.Abs(trace->Fraction - 1.0f)             < FLT_EPSILON
-                || lastN.Dot(trace->PlaneNormal.Normalized()) >= RAMP_BUG_THRESHOLD)
-            {
-                mv->AbsOrigin = origin;
-            }
+            return;
         }
 
-    original:
-        CCSPlayer_MovementService_CategorizePositionOrigin(servicePtr, mv, stayOnGround);
+        var wallStart = pm->EndPosition;
+        var wallEnd   = wallStart + (wallDirection * GROUND_CHECK_SHRINK_SIZE);
+        TraceHull(&wallStart, &wallEnd, ray, filter, trace);
+
+        if (trace->Fraction < 0.5f && !trace->StartInSolid)
+        {
+            pm->PlaneNormal = slopeNormal;
+        }
     }
 
     public int ListenerVersion  => IGameListener.ApiVersion;

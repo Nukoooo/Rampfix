@@ -9,6 +9,12 @@
             "library": "server",
             "windows": "40 55 56 57 41 54 41 55 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 48 8B F9",
             "linux": "48 B8 ? ? ? ? ? ? ? ? 55 66 0F EF C0 48 89 E5 41 57 41 56 41 55 41 89 D5"
+        },
+        // Called by TryPlayerMove and CategorizePosition, calls TraceShape
+        "TracePlayerBBox": {
+            "library": "server",
+            "windows": "48 89 74 24 ? 55 57 41 54 41 55 41 56 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 4C 8B B5 ? ? ? ? 49 8B F1",
+            "linux": "55 4D 89 CA 48 89 E5 41 57 49 89 F7 41 56 49 89 CE 41 55 49 89 D5 41 54 53 4C 89 C3 48 81 EC ? ? ? ? 80 BF"
         }
     }
 }
