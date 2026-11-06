@@ -32,7 +32,7 @@ public class RampFix : IModSharpModule, IGameListener
     private static unsafe delegate* unmanaged<nint, CGameTrace*, Vector*, Vector*, TraceShapeHull*, CTraceFilter*, void>
         TracePlayerBBoxOriginal;
 
-    private static unsafe delegate* unmanaged[SuppressGCTransition]<IntPtr, TraceShapeRay*, Vector*, Vector*,
+    private static unsafe delegate* unmanaged<IntPtr, TraceShapeRay*, Vector*, Vector*,
         CTraceFilter*, CGameTrace*, bool> TraceShape;
 
     private static nint g_pPhysicsQuery = 0;
@@ -166,7 +166,7 @@ public class RampFix : IModSharpModule, IGameListener
             return false;
         }
 
-        TraceShape = (delegate* unmanaged[SuppressGCTransition]<IntPtr, TraceShapeRay*, Vector*, Vector*, CTraceFilter*,
+        TraceShape = (delegate* unmanaged<IntPtr, TraceShapeRay*, Vector*, Vector*, CTraceFilter*,
             CGameTrace*, bool>) address;
 
         if (!_gameData.GetAddress("g_pPhysicsQuery", out address))
